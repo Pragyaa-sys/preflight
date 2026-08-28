@@ -9,13 +9,13 @@
 PreFlight is **100% stateless**:
 - ❌ No user accounts or login
 - ❌ No database (MongoDB, Postgres, Redis)
-- ❌ No persistent project storage (uploaded project ZIP is extracted temporarily, analyzed, and cleaned up)
+- ❌ No persistent project storage (uploaded project folder is analyzed in-memory/temporary workspace and cleaned up)
 
 ### The 4-Screen Flow
 ```text
 1. UPLOAD (/) ──► 2. DETECT & SELECT (/project) ──► 3. LIVE AUDIT (/audit) ──► 4. RESULTS (/results)
-   • Drop ZIP        • Detected Stack                  • Real-time progress       • Release Decision (BLOCKED vs READY)
-   • Unzip & Parse   • Toggle Checks (all on by default) • Concurrent check runner • Severity Breakdown & Full Report
+   • Drop Folder     • Detected Stack                  • Real-time progress       • Release Decision (BLOCKED vs READY)
+   • Parse & Filter  • Toggle Checks (all on by default) • Concurrent check runner • Severity Breakdown & Full Report
 ```
 
 ---
@@ -33,7 +33,7 @@ preflight/
     ├── app/                    # Next.js App Router (Pages & Backend APIs)
     │   ├── layout.tsx          # Root shell layout, global metadata & fonts
     │   ├── globals.css         # Tailwind styling & theme tokens
-    │   ├── page.tsx            # [Screen 1] Landing page & ZIP upload dropzone (/)
+    │   ├── page.tsx            # [Screen 1] Landing page & Folder upload / directory selector (/)
     │   ├── project/            # [Screen 2] Stack detection & check selector (/project)
     │   │   └── page.tsx
     │   ├── audit/              # [Screen 3] Live audit progress & live console (/audit)
@@ -41,7 +41,7 @@ preflight/
     │   ├── results/            # [Screen 4] Scores, findings viewer & release decision (/results)
     │   │   └── page.tsx
     │   └── api/                # Next.js Server-side Analysis API routes
-    │       ├── upload/         # POST: Temporary ZIP extraction & snapshot init
+    │       ├── upload/         # POST: Project folder ingest & snapshot init
     │       ├── detect/         # POST: Stack & framework detection
     │       ├── audit/          # POST: Check runner & live findings streaming
     │       └── report/         # GET/POST: Full HTML audit report generator
@@ -51,7 +51,7 @@ preflight/
     │
     ├── lib/                    # Core Business Logic & Check Engine
     │   ├── engine/             # Core analysis pipeline
-    │   │   ├── extractor.ts    # Unzip ZIP and filter ignore dirs (node_modules, .git, etc.)
+    │   │   ├── loader.ts       # Read folder files & filter ignore dirs (node_modules, .git, etc.)
     │   │   ├── detector.ts     # Detect language, framework (Next.js, Vite, Python, etc.)
     │   │   ├── snapshot.ts     # Build lightweight ProjectSnapshot (files, deps, scripts)
     │   │   └── scorer.ts       # Calculate release score & status (BLOCKED / REVIEW / READY)

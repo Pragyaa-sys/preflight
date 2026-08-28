@@ -1,26 +1,40 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-heading), sans-serif;
+  --font-body: var(--font-body), sans-serif;
+  --font-mono: var(--font-mono), monospace;
+
+  /* OLED Deep Dark Theme Tokens */
+  --color-oled-950: #000000; /* Pure OLED Canvas */
+  --color-oled-900: #08080a; /* Elevated OLED Surface */
+  --color-oled-850: #101014; /* Card / Input Surface */
+  --color-oled-800: #1c1c24; /* 1px Glass Borders */
+  --color-oled-700: #2d2d38; /* Hover Border */
+
+  /* Status Colors */
+  --color-status-ready: #10b981;   /* Electric Emerald (Ready to Ship / Pass) */
+  --color-status-review: #f59e0b;  /* Cyber Amber (Review / Warnings) */
+  --color-status-blocked: #f43f5e; /* Laser Crimson (Blocked / Critical) */
+  --color-status-cyan: #06b6d4;    /* Tech Cyan / Active Highlights */
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+:root {
+  --background: #000000;
+  --foreground: #f8fafc;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-body), sans-serif;
 }
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading), sans-serif;
+}
+
+code, pre, kbd, samp {
+  font-family: var(--font-mono), monospace;
+}
+
