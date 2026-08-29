@@ -36,12 +36,12 @@ function aggregatePackageJsons(workspacePath: string): {
 
   // Also check packages/* and apps/* if monorepo
   for (const sub of ['packages', 'apps']) {
-    const subPath = path.join(workspacePath, sub);
-    if (fs.existsSync(subPath) && fs.statSync(subPath).isDirectory()) {
+    const subPath = path.join(/*turbopackIgnore: true*/ workspacePath, sub);
+    if (fs.existsSync(/*turbopackIgnore: true*/ subPath) && fs.statSync(/*turbopackIgnore: true*/ subPath).isDirectory()) {
       try {
-        const subEntries = fs.readdirSync(subPath);
+        const subEntries = fs.readdirSync(/*turbopackIgnore: true*/ subPath);
         for (const entry of subEntries) {
-          potentialPkgDirs.push(path.join(subPath, entry));
+          potentialPkgDirs.push(path.join(/*turbopackIgnore: true*/ subPath, entry));
         }
       } catch {
         // Ignore read errors
