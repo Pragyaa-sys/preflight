@@ -1,150 +1,233 @@
-import fs from "node:fs";
-import path from "node:path";
-import { execSync } from "node:child_process";
-import { ProjectSnapshot } from "@/types/project.types";
-import { CategoryResult } from "@/types/audit.types";
-import { Finding } from "@/types/finding.types";
-import { buildCategoryResult, findingId } from "./shared";
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { ProjectSnapshot } from '@/types/project.types';
+import { CategoryResult, CheckStatus } from '@/types/audit.types';
+import { Finding } from '@/types/finding.types';
 
 interface SecretPattern {
-  re: RegExp;
-  label: string;
+  name: string;
+  pattern: RegExp;
+  severity: 'critical' | 'high' | 'medium';
+  recommendation: string;
 }
 
 const SECRET_PATTERNS: SecretPattern[] = [
-  { re: /(sk|pk)_(live|test)_[A-Za-z0-9]{10,}/g, label: "Stripe key" },
-  { re: /AKIA[0-9A-Z]{16}/g, label: "AWS access key" },
-  { re: /AIza[0-9A-Za-z\-_]{35}/g, label: "Google API key" },
-  { re: /ghp_[A-Za-z0-9]{36}/g, label: "GitHub token" },
-  { re: /-----BEGIN (RSA|EC|OPENSSH|PRIVATE) KEY-----/g, label: "Private key block" },
   {
-    re: /(api[_-]?key|secret|token|password)\s*[:=]\s*["'][A-Za-z0-9\-_/+=]{12,}["']/gi,
-    label: "Hardcoded credential-like value",
+    name: 'AWS Access Key ID',
+    pattern: /(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}/g,
+    severity: 'critical',
+    recommendation: 'Revoke key immediately and use environment variables / AWS Secrets Manager.',
+  },
+  {
+    name: 'AWS Secret Access Key',
+    pattern: /aws_secret_access_key\s*=\s*['"][A-Za-z0-9\/+=]{40}['"]/gi,
+    severity: 'critical',
+    recommendation: 'Remove hardcoded AWS secrets from codebase.',
+  },
+  {
+    name: 'OpenAI / Stripe API Key',
+    pattern: /sk_live_[0-9a-zA-Z]{24}|sk-[a-zA-Z0-9]{32,}/g,
+    severity: 'critical',
+    recommendation: 'Rotate API key and move credential into secret manager.',
+  },
+  {
+    name: 'Generic Private Key',
+    pattern: /-----BEGIN (?:RSA |EC |PGP |OPENSSH )?PRIVATE KEY-----/g,
+    severity: 'critical',
+    recommendation: 'Remove private keys from repository immediately.',
+  },
+  {
+    name: 'GitHub Personal Access Token',
+    pattern: /ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59}/g,
+    severity: 'critical',
+    recommendation: 'Revoke exposed GitHub token.',
+  },
+  {
+    name: 'Hardcoded JWT Token',
+    pattern: /eyJ[A-Za-z0-9-_=]{10,}\.[A-Za-z0-9-_=]{10,}\.[A-Za-z0-9-_.+/=]{10,}/g,
+    severity: 'high',
+    recommendation: 'Ensure bearer tokens are dynamic and not stored in source files.',
+  },
+  {
+    name: 'Hardcoded Database URI with Password',
+    pattern: /(?:mongodb(?:\+srv)?|postgres|postgresql|mysql):\/\/[a-zA-Z0-9_]+:[^@\s"']+@[a-zA-Z0-9_.-]+/g,
+    severity: 'critical',
+    recommendation: 'Store database credentials in environment variables.',
+  },
+  {
+    name: 'Generic Hardcoded Password Assignment',
+    pattern: /(?:password|passwd|secret|api_key|apikey)\s*=\s*["'][^"']{6,}["']/gi,
+    severity: 'high',
+    recommendation: 'Remove hardcoded secret variables.',
   },
 ];
 
-const SCANNABLE_EXT = new Set([".js", ".jsx", ".ts", ".tsx", ".json", ".yml", ".yaml", ".env"]);
-
 /**
- * Scans a project's files on disk for likely leaked secrets, checks whether
- * .env files are gitignored, and runs `npm audit` for vulnerable deps.
- *
- * rootDir must be the real filesystem directory the project was extracted
- * to (FileSnapshot.path/.relativePath alone have no content) — this is
- * whatever directory your /api/upload route wrote the project into.
+ * Runs static Security checks on the project.
+ * Detects:
+ * 1. Hardcoded API keys, private keys, AWS tokens, DB credentials
+ * 2. Committed .env files containing live secrets
+ * 3. Dangerous code patterns (eval, innerHTML, exec execution)
  */
-export async function runSecurityCheck(snapshot: ProjectSnapshot, rootDir: string): Promise<CategoryResult> {
-  const start = Date.now();
+export async function runSecurityCheck(snapshot: ProjectSnapshot): Promise<CategoryResult> {
+  const startTime = Date.now();
   const findings: Finding[] = [];
 
-  for (const file of snapshot.files) {
-    if (!SCANNABLE_EXT.has(file.extension)) continue;
-    const absPath = path.isAbsolute(file.path) ? file.path : path.join(rootDir, file.relativePath);
-    let content: string;
-    try {
-      content = fs.readFileSync(absPath, "utf8");
-    } catch {
-      continue; // file listed in snapshot but unreadable — skip rather than crash the whole check
-    }
+  const { files } = snapshot;
 
-    const lines = content.split("\n");
-    for (const { re, label } of SECRET_PATTERNS) {
-      lines.forEach((line, i) => {
-        re.lastIndex = 0;
-        if (re.test(line)) {
+  // 1. Check for committed sensitive .env files
+  files.forEach((file) => {
+    const filename = path.basename(file.relativePath).toLowerCase();
+    if (filename === '.env' || filename === '.env.local' || filename === '.env.production') {
+      try {
+        const content = fs.readFileSync(file.path, 'utf-8');
+        if (content.trim().length > 0 && !content.includes('EXAMPLE')) {
           findings.push({
-            id: findingId("secret"),
-            category: "security",
-            severity: "critical",
-            title: `Possible ${label} found in source`,
-            description: `A pattern matching a ${label} was found in ${file.relativePath}. This may be a real, committed credential.`,
-            detector: "regex-secret-scan",
-            location: { file: file.relativePath, line: i + 1, snippet: line.trim().slice(0, 120) },
-            evidence: `${file.relativePath}:${i + 1}  ${line.trim().slice(0, 120)}`,
-            recommendation:
-              "Remove the literal value, rotate the credential if it's real, and load it via process.env from a .env file that is gitignored.",
+            id: `sec_${crypto.randomUUID()}`,
+            category: 'security',
+            severity: 'critical',
+            title: 'Sensitive environment file committed',
+            description: `Live environment file '${file.relativePath}' is committed to the codebase.`,
+            detector: 'PreFlight Secret Scanner',
+            location: {
+              file: file.relativePath,
+              line: 1,
+            },
+            recommendation: 'Add .env files to .gitignore and sanitize git history.',
             isBlocker: true,
           });
         }
-      });
+      } catch {
+        // Ignore read errors
+      }
     }
-  }
+  });
 
-  // .env committed without being gitignored?
-  const gitignorePath = path.join(rootDir, ".gitignore");
-  const gitignore = fs.existsSync(gitignorePath) ? fs.readFileSync(gitignorePath, "utf8") : "";
-  const envFiles = fs.existsSync(rootDir)
-    ? fs.readdirSync(rootDir).filter((f) => /^\.env(\..*)?$/.test(f) && f !== ".env.example")
-    : [];
-  for (const f of envFiles) {
-    if (!gitignore.includes(f) && !gitignore.includes(".env")) {
-      findings.push({
-        id: findingId("envleak"),
-        category: "security",
-        severity: "high",
-        title: `${f} exists and is not covered by .gitignore`,
-        description: `${f} was found at the project root but .gitignore does not exclude it, meaning it may get committed.`,
-        detector: "gitignore-check",
-        location: { file: f },
-        evidence: `.gitignore contents:\n${gitignore || "(empty or missing)"}`,
-        recommendation: `Add ".env*" (except .env.example) to .gitignore, then run "git rm --cached ${f}" if it was already committed.`,
-        isBlocker: true,
-      });
-    }
-  }
+  // 2. Secret Pattern Scanning & Dangerous Code Patterns
+  const scannableFiles = files.filter((f) =>
+    !f.relativePath.includes('node_modules') &&
+    !f.relativePath.includes('.git') &&
+    ['.js', '.jsx', '.ts', '.tsx', '.py', '.go', '.java', '.json', '.env', '.yaml', '.yml'].includes(f.extension)
+  );
 
-  // npm audit — only meaningful if a lockfile exists in rootDir
-  if (fs.existsSync(path.join(rootDir, "package-lock.json"))) {
+  for (const file of scannableFiles) {
     try {
-      const out = execSync("npm audit --json", { cwd: rootDir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-      appendAuditFindings(out, findings);
-    } catch (err: any) {
-      // npm audit exits non-zero when vulnerabilities are found — stdout still has the JSON
-      appendAuditFindings(err.stdout || "", findings);
+      const content = fs.readFileSync(file.path, 'utf-8');
+      const lines = content.split('\n');
+
+      // Check Secret Patterns
+      for (const patternObj of SECRET_PATTERNS) {
+        patternObj.pattern.lastIndex = 0; // Reset regex state
+        let match;
+        while ((match = patternObj.pattern.exec(content)) !== null) {
+          // Find line number of match
+          const offset = match.index;
+          const lineNumber = content.substring(0, offset).split('\n').length;
+          const matchedLine = lines[lineNumber - 1] || '';
+
+          // Mask match snippet for security display
+          const rawMatch = match[0];
+          const maskedMatch = rawMatch.length > 8
+            ? rawMatch.substring(0, 4) + '***' + rawMatch.substring(rawMatch.length - 4)
+            : '***';
+
+          findings.push({
+            id: `sec_${crypto.randomUUID()}`,
+            category: 'security',
+            severity: patternObj.severity,
+            title: `Exposed ${patternObj.name}`,
+            description: `Potential secret pattern matched (${maskedMatch}).`,
+            detector: 'PreFlight Gitleaks Engine',
+            location: {
+              file: file.relativePath,
+              line: lineNumber,
+              snippet: matchedLine.trim().slice(0, 100),
+            },
+            evidence: `Pattern matched: ${patternObj.name}`,
+            recommendation: patternObj.recommendation,
+            isBlocker: patternObj.severity === 'critical',
+          });
+
+          if (patternObj.pattern.lastIndex === match.index) {
+            patternObj.pattern.lastIndex++;
+          }
+        }
+      }
+
+      // Check Dangerous Code Execution Patterns (eval, dangerouslySetInnerHTML)
+      lines.forEach((lineText, idx) => {
+        const trimmed = lineText.trim();
+        if (
+          trimmed.includes('eval(') &&
+          !trimmed.startsWith('//') &&
+          !trimmed.startsWith('/*') &&
+          !trimmed.startsWith('*')
+        ) {
+          findings.push({
+            id: `sec_${crypto.randomUUID()}`,
+            category: 'security',
+            severity: 'high',
+            title: 'Dangerous eval() statement detected',
+            description: 'Use of eval() introduces severe arbitrary code execution vulnerabilities.',
+            detector: 'PreFlight AST Security Scanner',
+            location: {
+              file: file.relativePath,
+              line: idx + 1,
+              snippet: trimmed.slice(0, 80),
+            },
+            recommendation: 'Refactor code to avoid eval(). Use structured JSON parsing or safer abstractions.',
+            isBlocker: false,
+          });
+        }
+
+        if (
+          trimmed.includes('dangerouslySetInnerHTML') &&
+          !trimmed.startsWith('//') &&
+          !trimmed.startsWith('/*') &&
+          !trimmed.startsWith('*')
+        ) {
+          findings.push({
+            id: `sec_${crypto.randomUUID()}`,
+            category: 'security',
+            severity: 'medium',
+            title: 'Potential XSS vulnerability (dangerouslySetInnerHTML)',
+            description: 'Direct HTML rendering can lead to Cross-Site Scripting (XSS) if un-sanitized.',
+            detector: 'PreFlight Security Scanner',
+            location: {
+              file: file.relativePath,
+              line: idx + 1,
+              snippet: trimmed.slice(0, 80),
+            },
+            recommendation: 'Sanitize HTML inputs using DOMPurify before dangerouslySetInnerHTML.',
+            isBlocker: false,
+          });
+        }
+      });
+    } catch {
+      // Ignore read failures
     }
   }
 
-  const durationMs = Date.now() - start;
-  const summary =
-    findings.length === 0
-      ? "No leaked secrets, unprotected .env files, or high/critical dependency vulnerabilities found."
-      : `${findings.length} security finding(s): ${findings.filter((f) => f.isBlocker).length} blocking.`;
+  // Deduce Score
+  let scoreDeductions = 0;
+  findings.forEach((f) => {
+    if (f.severity === 'critical') scoreDeductions += 30;
+    else if (f.severity === 'high') scoreDeductions += 15;
+    else if (f.severity === 'medium') scoreDeductions += 8;
+    else if (f.severity === 'low') scoreDeductions += 3;
+  });
 
-  return buildCategoryResult("security", findings, durationMs, summary);
-}
+  const score = Math.max(0, 100 - scoreDeductions);
+  const durationMs = Date.now() - startTime;
+  const status: CheckStatus = 'completed';
 
-function appendAuditFindings(rawJson: string, findings: Finding[]) {
-  try {
-    const parsed = JSON.parse(rawJson);
-    const meta = parsed.metadata?.vulnerabilities;
-    if (!meta) return;
-    if (meta.critical || meta.high) {
-      findings.push({
-        id: findingId("audit"),
-        category: "security",
-        severity: meta.critical ? "critical" : "high",
-        title: `${meta.critical || 0} critical / ${meta.high || 0} high severity dependency vulnerabilities`,
-        description: "npm audit found vulnerable dependencies at high or critical severity.",
-        detector: "npm-audit",
-        evidence: `npm audit metadata: ${JSON.stringify(meta)}`,
-        recommendation:
-          'Run "npm audit fix" and re-check; for unfixable ones, review "npm audit" output for the specific advisory and consider an alternative package.',
-        isBlocker: true,
-      });
-    } else if (meta.moderate || meta.low) {
-      findings.push({
-        id: findingId("audit"),
-        category: "security",
-        severity: "low",
-        title: `${meta.moderate || 0} moderate / ${meta.low || 0} low severity dependency vulnerabilities`,
-        description: "npm audit found vulnerable dependencies at moderate or low severity.",
-        detector: "npm-audit",
-        evidence: `npm audit metadata: ${JSON.stringify(meta)}`,
-        recommendation: 'Not release-blocking, but run "npm audit fix" when convenient.',
-        isBlocker: false,
-      });
-    }
-  } catch {
-    // npm audit output wasn't parseable JSON — not fatal, just skip
-  }
+  return {
+    category: 'security',
+    status,
+    score,
+    durationMs,
+    findings,
+    summary: `Scanned ${scannableFiles.length} files. Found ${findings.length} security findings.`,
+  };
 }

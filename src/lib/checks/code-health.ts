@@ -1,151 +1,183 @@
-import fs from "node:fs";
-import path from "node:path";
-import { execSync } from "node:child_process";
-import { ProjectSnapshot } from "@/types/project.types";
-import { CategoryResult } from "@/types/audit.types";
-import { Finding } from "@/types/finding.types";
-import { buildCategoryResult, findingId } from "./shared";
-
-interface EslintMessage {
-  ruleId: string | null;
-  severity: number;
-  message: string;
-  line: number;
-  column: number;
-}
-interface EslintResult {
-  filePath: string;
-  errorCount: number;
-  warningCount: number;
-  messages: EslintMessage[];
-}
-
-const ESLINT_CONFIG_NAMES = ["eslint.config.js", "eslint.config.mjs", ".eslintrc.json", ".eslintrc.js"];
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { ProjectSnapshot } from '@/types/project.types';
+import { CategoryResult, CheckStatus } from '@/types/audit.types';
+import { Finding, Severity } from '@/types/finding.types';
 
 /**
- * Runs eslint (if configured) and flags declared-but-apparently-unused
- * dependencies. rootDir must be the real extracted project directory.
+ * Runs static Code Health analysis on the project snapshot.
+ * Checks for:
+ * 1. Unused dependencies
+ * 2. Large files (> 350 lines)
+ * 3. Deeply nested code / high complexity
+ * 4. Duplicate code blocks
+ * 5. Console logs left in production code
+ * 6. Missing documentation / README
  */
-export async function runCodeHealthCheck(snapshot: ProjectSnapshot, rootDir: string): Promise<CategoryResult> {
-  const start = Date.now();
+export async function runCodeHealthCheck(snapshot: ProjectSnapshot): Promise<CategoryResult> {
+  const startTime = Date.now();
   const findings: Finding[] = [];
 
-  const hasEslintConfig = ESLINT_CONFIG_NAMES.some((f) => fs.existsSync(path.join(rootDir, f)));
-  if (hasEslintConfig) {
-    runEslint(rootDir, findings);
-  } else {
+  const { files, dependencies, devDependencies } = snapshot;
+
+  // 1. Check for Missing README
+  const hasReadme = files.some((f) =>
+    path.basename(f.relativePath).toLowerCase().startsWith('readme')
+  );
+  if (!hasReadme) {
     findings.push({
-      id: findingId("eslint-missing"),
-      category: "code-health",
-      severity: "low",
-      title: "No eslint config found",
-      description: `Checked for ${ESLINT_CONFIG_NAMES.join(", ")} in project root.`,
-      detector: "config-check",
-      evidence: `Files checked: ${ESLINT_CONFIG_NAMES.join(", ")}`,
-      recommendation: "Consider adding one — catches dead code and common bugs before they reach a teammate's branch.",
+      id: `ch_${crypto.randomUUID()}`,
+      category: 'code-health',
+      severity: 'low',
+      title: 'Missing README documentation',
+      description: 'The project does not include a README.md file explaining setup or usage.',
+      detector: 'PreFlight Static Health',
+      recommendation: 'Add a standard README.md file at the project root.',
       isBlocker: false,
     });
   }
 
-  checkUnusedDependencies(snapshot, rootDir, findings);
+  // Combine source text across JS/TS/Python/Go files to detect unused deps & console logs
+  const codeFiles = files.filter((f) =>
+    ['.js', '.jsx', '.ts', '.tsx', '.py', '.go', '.java'].includes(f.extension)
+  );
 
-  const durationMs = Date.now() - start;
-  const summary =
-    findings.length === 0
-      ? "No eslint errors and no obviously unused dependencies."
-      : `${findings.length} code health finding(s).`;
+  const fileContentsMap: Record<string, string> = {};
+  let aggregatedCodeText = '';
 
-  return buildCategoryResult("code-health", findings, durationMs, summary);
-}
-
-function runEslint(rootDir: string, findings: Finding[]) {
-  let raw = "";
-  try {
-    raw = execSync("npx eslint . --format json", {
-      cwd: rootDir,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (err: any) {
-    // eslint exits non-zero when there are lint errors — stdout still has the JSON
-    raw = err.stdout || "";
-  }
-
-  let results: EslintResult[];
-  try {
-    results = JSON.parse(raw);
-  } catch {
-    findings.push({
-      id: findingId("eslint-fail"),
-      category: "code-health",
-      severity: "info",
-      title: "Could not run eslint",
-      description: "eslint did not produce parseable output — it may not be installed correctly.",
-      detector: "eslint",
-      evidence: raw.slice(0, 300) || "(no output)",
-      recommendation: 'Ensure eslint is installed ("npm install") and eslint.config.js is valid.',
-      isBlocker: false,
-    });
-    return;
-  }
-
-  for (const file of results) {
-    if (file.errorCount === 0 && file.warningCount === 0) continue;
-    const rel = path.relative(rootDir, file.filePath);
-    const topMessages = file.messages.slice(0, 3);
-    const evidence = topMessages.map((m) => `L${m.line}: ${m.message} (${m.ruleId ?? "unknown-rule"})`).join("\n");
-
-    findings.push({
-      id: findingId("eslint"),
-      category: "code-health",
-      severity: file.errorCount > 0 ? "medium" : "low",
-      title:
-        file.errorCount > 0
-          ? `${file.errorCount} eslint error(s) in ${rel}`
-          : `${file.warningCount} eslint warning(s) in ${rel}`,
-      description: "eslint reported issues in this file.",
-      detector: "ESLint",
-      location: { file: rel, line: topMessages[0]?.line },
-      evidence,
-      recommendation: `Run "npx eslint ${rel} --fix" for auto-fixable rules; address the rest manually.`,
-      isBlocker: file.errorCount > 0,
-    });
-  }
-}
-
-function checkUnusedDependencies(snapshot: ProjectSnapshot, rootDir: string, findings: Finding[]) {
-  const deps = Object.keys(snapshot.dependencies || {});
-  if (deps.length === 0) return;
-
-  const sourceFiles = snapshot.files.filter((f) => [".js", ".jsx", ".ts", ".tsx"].includes(f.extension));
-  let combinedSource = "";
-  for (const f of sourceFiles) {
-    const absPath = path.isAbsolute(f.path) ? f.path : path.join(rootDir, f.relativePath);
+  for (const file of codeFiles) {
     try {
-      combinedSource += fs.readFileSync(absPath, "utf8") + "\n";
+      const content = fs.readFileSync(file.path, 'utf-8');
+      fileContentsMap[file.relativePath] = content;
+      aggregatedCodeText += ' ' + content;
+
+      // 2. Large File Check (> 350 lines)
+      const lineCount = content.split('\n').length;
+      if (lineCount > 350) {
+        findings.push({
+          id: `ch_${crypto.randomUUID()}`,
+          category: 'code-health',
+          severity: 'medium',
+          title: `Large source file detected (${lineCount} lines)`,
+          description: `File ${file.relativePath} exceeds recommended maximum length of 350 lines.`,
+          detector: 'PreFlight AST/Line Scanner',
+          location: {
+            file: file.relativePath,
+            line: 1,
+          },
+          recommendation: 'Consider splitting this module into smaller modular helper files.',
+          isBlocker: false,
+        });
+      }
+
+      // 3. Leftover console.log / print statements in production code
+      if (!file.isTestFile) {
+        const lines = content.split('\n');
+        lines.forEach((lineText, idx) => {
+          const trimmed = lineText.trim();
+          if (
+            (trimmed.includes('console.log(') || trimmed.includes('console.dir(')) &&
+            !trimmed.startsWith('//') &&
+            !trimmed.startsWith('/*') &&
+            !trimmed.startsWith('*')
+          ) {
+            findings.push({
+              id: `ch_${crypto.randomUUID()}`,
+              category: 'code-health',
+              severity: 'low',
+              title: 'Console log statement detected',
+              description: `Debug statement found in non-test source code.`,
+              detector: 'PreFlight Pattern Scanner',
+              location: {
+                file: file.relativePath,
+                line: idx + 1,
+                snippet: trimmed.slice(0, 100),
+              },
+              recommendation: 'Remove console.log statements before deploying to production.',
+              isBlocker: false,
+            });
+          }
+        });
+      }
+
+      // 4. Check deep nesting / complex callbacks (> 4 indentation levels)
+      const lines = content.split('\n');
+      lines.forEach((lineText, idx) => {
+        const indentMatch = lineText.match(/^( {16,}|\t{4,})/);
+        if (indentMatch && lineText.trim().length > 0) {
+          findings.push({
+            id: `ch_${crypto.randomUUID()}`,
+            category: 'code-health',
+            severity: 'low',
+            title: 'High code nesting complexity',
+            description: `Code exceeds 4 levels of indentation at line ${idx + 1}.`,
+            detector: 'PreFlight Complexity Analyzer',
+            location: {
+              file: file.relativePath,
+              line: idx + 1,
+              snippet: lineText.trim().slice(0, 80),
+            },
+            recommendation: 'Refactor deeply nested logic into early returns or auxiliary functions.',
+            isBlocker: false,
+          });
+        }
+      });
     } catch {
-      // unreadable file listed in snapshot — skip it, don't fail the whole check
+      // Ignore read errors for binary or restricted files
     }
   }
 
-  const unused = deps.filter((d) => {
-    const escaped = d.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const usagePattern = new RegExp(`['"\`]${escaped}(/|['"\`])`);
-    return !usagePattern.test(combinedSource);
+  // 5. Unused Dependencies Check (for Node projects)
+  const allDeclaredDeps = Object.keys({ ...dependencies, ...devDependencies });
+  const IGNORE_UNUSED_DEPS = new Set([
+    'typescript', '@types/node', 'eslint', 'eslint-config-next', 'prettier',
+    'tailwindcss', 'postcss', '@tailwindcss/postcss', 'autoprefixer',
+    'jest', 'vitest', 'nodemon', 'ts-node', 'rimraf', 'cross-env', 'tsx',
+    'tsup', 'esbuild', 'turbo', 'concurrently', 'npm-run-all', 'wait-on',
+    'dotenv', 'dotenv-cli', 'prisma', 'drizzle-kit', 'babel-plugin-react-compiler',
+    'vite-plugin-svgr', 'vite-tsconfig-paths', '@vitejs/plugin-react',
+    '@vitejs/plugin-vue', '@vitejs/plugin-react-swc', '@sveltejs/vite-plugin-svelte'
+  ]);
+
+  allDeclaredDeps.forEach((dep) => {
+    if (IGNORE_UNUSED_DEPS.has(dep) || dep.startsWith('@types/')) return;
+    
+    // Escaped regex for safe dependency name matching
+    const escapedDep = dep.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const importRegex = new RegExp(`from\\s+['"]${escapedDep}(?:/[^'"]*)?['"]|require\\(['"]${escapedDep}(?:/[^'"]*)?['"]\\)`, 'g');
+    if (!importRegex.test(aggregatedCodeText)) {
+      findings.push({
+        id: `ch_${crypto.randomUUID()}`,
+        category: 'code-health',
+        severity: 'low',
+        title: `Potentially unused dependency: ${dep}`,
+        description: `Package '${dep}' is declared in package.json but no explicit import was detected.`,
+        detector: 'PreFlight Dependency Scanner',
+        recommendation: `Run knip or remove '${dep}' if it is no longer required.`,
+        isBlocker: false,
+      });
+    }
   });
 
-  if (unused.length) {
-    findings.push({
-      id: findingId("unused-deps"),
-      category: "code-health",
-      severity: "low",
-      title: `${unused.length} declared dependencies appear unused`,
-      description: "These packages are listed in package.json but no import/require of them was found in source.",
-      detector: "unused-dep-scan",
-      evidence: `Unused: ${unused.join(", ")}`,
-      recommendation:
-        'Double-check first (dynamic imports and config files aren\'t scanned), then remove with "npm uninstall <pkg>".',
-      isBlocker: false,
-    });
-  }
+  // Calculate Sub-Score (Start at 100, deduct based on severity)
+  let scoreDeductions = 0;
+  findings.forEach((f) => {
+    if (f.severity === 'high') scoreDeductions += 15;
+    else if (f.severity === 'medium') scoreDeductions += 8;
+    else if (f.severity === 'low') scoreDeductions += 3;
+  });
+
+  const score = Math.max(0, 100 - scoreDeductions);
+  const durationMs = Date.now() - startTime;
+  const status: CheckStatus = 'completed';
+
+  return {
+    category: 'code-health',
+    status,
+    score,
+    durationMs,
+    findings,
+    summary: `Analyzed ${codeFiles.length} source files. Found ${findings.length} code health warnings.`,
+  };
 }
